@@ -165,6 +165,7 @@ jobs:
           Write-Host "Tailscale installed successfully."
 
       # 4. Connect Tailscale
+      
       - name: Connect Tailscale
         shell: pwsh
         env:
@@ -172,33 +173,48 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
 
-          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTHKEY)) {
+          $key = $env:TAILSCALE_AUTHKEY.Trim()
+
+          if ([string]::IsNullOrWhiteSpace($key)) {
             throw "TAILSCALE_AUTHKEY secret is missing."
+          }
+
+          if (-not $key.StartsWith("tskey-auth-")) {
+            throw "Invalid key type. Expected a Tailscale Auth Key starting with tskey-auth-."
           }
 
           $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
 
+          if (-not (Test-Path $ts)) {
+            throw "Tailscale executable not found."
+          }
+
           Write-Host "Connecting to Tailscale..."
 
           & $ts up `
-            "--authkey=$env:TAILSCALE_AUTHKEY" `
+            "--auth-key=$key" `
             "--hostname=abbas-rdp-$env:GITHUB_RUN_ID" `
             "--accept-dns=false"
 
-          if ($LASTEXITCODE -ne 0) {
-            throw "Tailscale connection failed."
+          $exitCode = $LASTEXITCODE
+
+          # Clear the local variable
+          $key = $null
+
+          if ($exitCode -ne 0) {
+            throw "Tailscale authentication failed. Check the Auth Key in GitHub Secrets."
           }
 
           $ip = $null
 
           for ($i = 0; $i -lt 20; $i++) {
-
             $ip = (& $ts ip -4 | Select-Object -First 1).Trim()
 
-            if ($ip) {
+            if ($ip -match '^100\.') {
               break
             }
 
+            $ip = $null
             Start-Sleep -Seconds 5
           }
 
@@ -209,6 +225,8 @@ jobs:
           "TAILSCALE_IP=$ip" >> $env:GITHUB_ENV
 
           Write-Host "Tailscale connected successfully."
+          Write-Host "Tailscale IP: $ip"
+
 
       # 5. Verify RDP
       - name: Verify RDP
