@@ -1,0 +1,308 @@
+
+name: Abbas RDP Performance - 16GB
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  rdp:
+    runs-on: windows-2022
+    timeout-minutes: 350
+
+    steps:
+
+      # 1. Configure Windows and RDP
+      - name: Configure Windows RDP
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Write-Host "Configuring Windows RDP..."
+
+          # Enable Remote Desktop
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name 'fDenyTSConnections' -Value 0
+
+          # Enable Network Level Authentication
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name 'UserAuthentication' -Value 1
+
+          # Require secure RDP layer
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name 'SecurityLayer' -Value 2
+
+          # Enable RDP service
+          Set-Service TermService -StartupType Automatic
+          Start-Service TermService
+
+          # Disable existing broad Remote Desktop firewall rules
+          Get-NetFirewallRule -DisplayGroup "Remote Desktop" `
+            -ErrorAction SilentlyContinue |
+            Disable-NetFirewallRule
+
+          # Remove previous custom rule
+          Get-NetFirewallRule -DisplayName "Abbas-RDP" `
+            -ErrorAction SilentlyContinue |
+            Remove-NetFirewallRule
+
+          # Allow RDP only through Tailscale IPv4 range
+          New-NetFirewallRule `
+            -DisplayName "Abbas-RDP" `
+            -Direction Inbound `
+            -Protocol TCP `
+            -LocalPort 3389 `
+            -RemoteAddress "100.64.0.0/10" `
+            -Action Allow `
+            -Profile Any
+
+          # High Performance power plan
+          powercfg /setactive SCHEME_MIN
+
+          Write-Host "Windows configuration completed."
+
+      # 2. Create RDP Administrator
+     
+      - name: Diagnose and Create RDP User
+        shell: pwsh
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Write-Host "Checking Windows password policy..."
+
+          # Display local password policy
+          net accounts
+
+          # Export detailed security policy
+          $policyFile = "$env:TEMP\security.inf"
+
+          secedit /export /cfg $policyFile /quiet
+
+          $policy = Get-Content $policyFile
+
+          Write-Host "Password Policy Details:"
+
+          $policy | Where-Object {
+            $_ -match 'MinimumPasswordLength|PasswordComplexity|PasswordHistorySize|MaximumPasswordAge'
+          } | ForEach-Object {
+            Write-Host $_
+          }
+
+          # Validate secret
+          $password = $env:RDP_PASSWORD
+
+          if ([string]::IsNullOrWhiteSpace($password)) {
+            throw "RDP_PASSWORD secret is missing."
+          }
+
+          Write-Host "Password length: $($password.Length)"
+
+          Write-Host "Uppercase: $($password -cmatch '[A-Z]')"
+          Write-Host "Lowercase: $($password -cmatch '[a-z]')"
+          Write-Host "Numbers: $($password -match '[0-9]')"
+          Write-Host "Special characters: $($password -match '[^a-zA-Z0-9]')"
+
+          if (
+            $password.Length -lt 20 -or
+            $password -cnotmatch '[A-Z]' -or
+            $password -cnotmatch '[a-z]' -or
+            $password -notmatch '[0-9]' -or
+            $password -notmatch '[^a-zA-Z0-9]' -or
+            $password -match '(?i)RDP'
+          ) {
+            throw "Password does not meet validation requirements. Update RDP_PASSWORD."
+          }
+
+          $securePass = ConvertTo-SecureString `
+            $password -AsPlainText -Force
+
+          New-LocalUser `
+            -Name "RDP" `
+            -Password $securePass `
+            -PasswordNeverExpires `
+            -AccountNeverExpires
+
+          Add-LocalGroupMember `
+            -Group "Administrators" `
+            -Member "RDP"
+
+          Add-LocalGroupMember `
+            -Group "Remote Desktop Users" `
+            -Member "RDP"
+
+          Write-Host "RDP user created successfully."
+
+
+      # 3. Install Tailscale
+      - name: Install Tailscale
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $url = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
+
+          $installer = "$env:TEMP\tailscale.msi"
+
+          Write-Host "Downloading Tailscale..."
+
+          Invoke-WebRequest `
+            -Uri $url `
+            -OutFile $installer
+
+          Start-Process msiexec.exe `
+            -ArgumentList "/i", "`"$installer`"", "/quiet", "/norestart" `
+            -Wait
+
+          Remove-Item $installer -Force
+
+          Write-Host "Tailscale installed successfully."
+
+      # 4. Connect Tailscale
+      - name: Connect Tailscale
+        shell: pwsh
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTHKEY)) {
+            throw "TAILSCALE_AUTHKEY secret is missing."
+          }
+
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+          Write-Host "Connecting to Tailscale..."
+
+          & $ts up `
+            "--authkey=$env:TAILSCALE_AUTHKEY" `
+            "--hostname=abbas-rdp-$env:GITHUB_RUN_ID" `
+            "--accept-dns=false"
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Tailscale connection failed."
+          }
+
+          $ip = $null
+
+          for ($i = 0; $i -lt 20; $i++) {
+
+            $ip = (& $ts ip -4 | Select-Object -First 1).Trim()
+
+            if ($ip) {
+              break
+            }
+
+            Start-Sleep -Seconds 5
+          }
+
+          if (-not $ip) {
+            throw "Tailscale IP was not assigned."
+          }
+
+          "TAILSCALE_IP=$ip" >> $env:GITHUB_ENV
+
+          Write-Host "Tailscale connected successfully."
+
+      # 5. Verify RDP
+      - name: Verify RDP
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Write-Host "Testing RDP connectivity..."
+
+          $connected = $false
+
+          for ($i = 0; $i -lt 20; $i++) {
+
+            $test = Test-NetConnection `
+              -ComputerName 127.0.0.1 `
+              -Port 3389 `
+              -WarningAction SilentlyContinue
+
+            if ($test.TcpTestSucceeded) {
+              $connected = $true
+              break
+            }
+
+            Start-Sleep -Seconds 5
+          }
+
+          if (-not $connected) {
+            throw "RDP port 3389 is not responding."
+          }
+
+          Write-Host "RDP service is ready."
+
+      # 6. System Performance Information
+      - name: System Performance Information
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $cpu = Get-CimInstance Win32_Processor
+
+          $computer = Get-CimInstance Win32_ComputerSystem
+
+          $os = Get-CimInstance Win32_OperatingSystem
+
+          $disk = Get-CimInstance Win32_LogicalDisk `
+            -Filter "DeviceID='C:'"
+
+          Write-Host ""
+          Write-Host "========== SYSTEM INFO =========="
+
+          Write-Host "OS: $($os.Caption)"
+
+          Write-Host "CPU: $($cpu.Name)"
+
+          Write-Host "CPU Cores: $($cpu.NumberOfCores)"
+
+          Write-Host "Logical CPUs: $($cpu.NumberOfLogicalProcessors)"
+
+          Write-Host "RAM Total: $([math]::Round($computer.TotalPhysicalMemory / 1GB, 2)) GB"
+
+          Write-Host "RAM Free: $([math]::Round($os.FreePhysicalMemory / 1MB, 2)) GB"
+
+          Write-Host "Disk Total: $([math]::Round($disk.Size / 1GB, 2)) GB"
+
+          Write-Host "Disk Free: $([math]::Round($disk.FreeSpace / 1GB, 2)) GB"
+
+          Write-Host "================================"
+
+          Write-Host "RDP ADDRESS: $env:TAILSCALE_IP"
+
+          Write-Host "USERNAME: RDP"
+
+      # 7. Keep RDP Alive
+      - name: Maintain RDP Session
+        shell: pwsh
+        run: |
+          Write-Host ""
+          Write-Host "================================"
+          Write-Host "ABBAS RDP PERFORMANCE ACTIVE"
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Username: RDP"
+          Write-Host "Maximum session: 350 minutes"
+          Write-Host "================================"
+
+          while ($true) {
+
+            $os = Get-CimInstance Win32_OperatingSystem
+
+            $freeRam = [math]::Round(
+              $os.FreePhysicalMemory / 1MB, 2
+            )
+
+            Write-Host "[$(Get-Date)] RDP ACTIVE | Free RAM: $freeRam GB"
+
+            Start-Sleep -Seconds 300
+
+          }
